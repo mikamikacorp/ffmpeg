@@ -55,9 +55,12 @@ aws ecr get-login-password --region "${REGION}" | \
 # ─── 3. Docker build & push ───────────────────────────────────────────────────
 echo ""
 echo "[3/5] Docker build & push…"
-docker build --platform linux/amd64 -t "${ECR_REPO_NAME}:latest" .
-docker tag "${ECR_REPO_NAME}:latest" "${ECR_URI}:latest"
-docker push "${ECR_URI}:latest"
+docker buildx build \
+    --platform linux/amd64 \
+    --provenance=false \
+    -t "${ECR_URI}:latest" \
+    --push \
+    .
 
 # ─── 4. IAM role ──────────────────────────────────────────────────────────────
 echo ""
