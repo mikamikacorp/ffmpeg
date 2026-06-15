@@ -112,6 +112,37 @@ def _generate_gradient(idx: int) -> Image.Image:
     return Image.fromarray(rgb,"RGB")
 
 
+# ── S3 image download ─────────────────────────────────────────────────────────
+
+def _download_from_s3_images(dest_dir: str, bucket: str, prefix: str, count: int) -> list[str]:
+    s3        = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                keys.append(key)
+
+    if not keys:
+        raise RuntimeError(f"No images found in s3://{bucket}/{prefix}")
+
+    print(f"Found {len(keys)} images in s3://{bucket}/{prefix}")
+
+    paths: list[str] = []
+    for i in range(count):
+        key  = keys[i % len(keys)]
+        ext  = os.path.splitext(key)[1] or ".jpg"
+        path = os.path.join(dest_dir, f"photo_{i:03d}{ext}")
+        s3.download_file(bucket, key, path)
+        paths.append(path)
+        if (i + 1) % 10 == 0:
+            print(f"  {i+1}/{count} downloaded")
+
+    return paths
+
+
 # ── Unsplash download ────────────────────────────────────────────────────────
 
 def _download_from_unsplash(dest_dir: str, access_key: str, count: int) -> list[str]:
@@ -199,17 +230,23 @@ def create_scene_frames(tmp_dir: str) -> list[str]:
     src_dir   = os.path.join(tmp_dir,"sources"); os.makedirs(src_dir,exist_ok=True)
     scene_dir = os.path.join(tmp_dir,"scenes");  os.makedirs(scene_dir,exist_ok=True)
 
-    access_key = os.environ.get("UNSPLASH_ACCESS_KEY")
-    if access_key:
-        print(f"Downloading {NUM_SOURCE_IMAGES} photos from Unsplash…")
-        src_paths = _download_from_unsplash(src_dir, access_key, NUM_SOURCE_IMAGES)
+    images_bucket = os.environ.get("PHOTOS_S3_BUCKET")
+    if images_bucket:
+        prefix = os.environ.get("PHOTOS_S3_PREFIX", "")
+        print(f"Downloading {NUM_SOURCE_IMAGES} photos from S3…")
+        src_paths = _download_from_s3_images(src_dir, images_bucket, prefix, NUM_SOURCE_IMAGES)
     else:
-        print(f"Generating {NUM_SOURCE_IMAGES} gradient images…")
-        src_paths = []
-        for i in range(NUM_SOURCE_IMAGES):
-            p = os.path.join(src_dir,f"src_{i:03d}.jpg")
-            _generate_gradient(i).save(p,"JPEG",quality=85)
-            src_paths.append(p)
+        access_key = os.environ.get("UNSPLASH_ACCESS_KEY")
+        if access_key:
+            print(f"Downloading {NUM_SOURCE_IMAGES} photos from Unsplash…")
+            src_paths = _download_from_unsplash(src_dir, access_key, NUM_SOURCE_IMAGES)
+        else:
+            print(f"Generating {NUM_SOURCE_IMAGES} gradient images…")
+            src_paths = []
+            for i in range(NUM_SOURCE_IMAGES):
+                p = os.path.join(src_dir,f"src_{i:03d}.jpg")
+                _generate_gradient(i).save(p,"JPEG",quality=85)
+                src_paths.append(p)
 
     scene_paths: list[str] = []
     src_idx = 0
@@ -262,8 +299,9 @@ def get_music(tmp_dir: str, total_duration: float) -> str | None:
 
     s3_key = os.environ.get("MUSIC_S3_KEY")
     if s3_key:
+        music_bucket = os.environ.get("MUSIC_S3_BUCKET", os.environ["OUTPUT_BUCKET"])
         print(f"Downloading music from S3…")
-        boto3.client("s3").download_file(os.environ["OUTPUT_BUCKET"],s3_key,path)
+        boto3.client("s3").download_file(music_bucket, s3_key, path)
         return path
 
     music_url = os.environ.get("MUSIC_URL")
@@ -660,16 +698,12 @@ def lambda_handler(event, context):
         slideshow_path = os.path.join(tmp_dir, "slideshow.mp4")
         build_slideshow_clip(scene_paths, slideshow_path)
 
-        # 4. FIN card
-        print("── FIN card ──")
-        fin_path = create_fin_clip(tmp_dir)
-
-        # 5. Scrolling end credits
+        # 4. Scrolling end credits
         print("── Outro ──")
         outro_path = create_outro_clip(tmp_dir, title, NUM_SOURCE_IMAGES, year)
 
-        # 6. Music
-        all_clips  = [intro_path, slideshow_path, fin_path, outro_path]
+        # 5. Music
+        all_clips  = [intro_path, slideshow_path, outro_path]
         total_dur  = sum(_get_duration(p) for p in all_clips)
         music_path = get_music(tmp_dir, total_dur)
 
