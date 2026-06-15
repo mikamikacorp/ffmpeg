@@ -1,14 +1,12 @@
 import datetime
-import io
 import json
-import math
 import os
 import subprocess
-import urllib.request
-import urllib.parse
 import boto3
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+# /opt/bin is where Lambda layer binaries (ffmpeg, ffprobe) are placed
+os.environ["PATH"] = "/opt/bin:" + os.environ.get("PATH", "")
 
 # ── Video constants ──────────────────────────────────────────────────────────
 WIDTH, HEIGHT, FPS = 1280, 720, 30
@@ -16,25 +14,13 @@ DURATION   = 4.1   # seconds each photo scene is displayed
 TRANSITION = 0.5   # xfade transition duration
 
 INTRO_DURATION = 8.0   # cinematic title card
-FIN_DURATION   = 5.0   # "FIN" card between slideshow and credits
 OUTRO_DURATION = 22.0  # scrolling end credits
 
-# ── Scene plan (50 scenes) ───────────────────────────────────────────────────
-SCENE_PLAN = [
-    "full", "full", "lr",   "full", "full",
-    "tb",   "full", "full", "lr",   "full",
-    "full", "full", "tb",   "full", "lr",
-    "full", "full", "full", "tb",   "full",
-    "lr",   "full", "full", "full", "grid",
-    "full", "full", "lr",   "full", "tb",
-    "full", "full", "full", "lr",   "full",
-    "tb",   "full", "full", "full", "lr",
-    "full", "full", "tb",   "full", "full",
-    "grid", "full", "full", "lr",   "full",
-]
 _COST = {"full": 1, "lr": 2, "tb": 2, "grid": 4}
-NUM_SCENES        = len(SCENE_PLAN)
-NUM_SOURCE_IMAGES = sum(_COST[s] for s in SCENE_PLAN)  # 71
+_SCENE_PATTERN = [
+    "full", "full", "lr",  "full", "full",
+    "tb",   "full", "full","lr",   "full",
+]
 
 TRANSITIONS = [
     "fade",       "wipeleft",   "slideleft",   "dissolve",    "fadeblack",
@@ -50,10 +36,6 @@ TRANSITIONS = [
 ]
 
 GAP, GAP_COLOR = 5, (15, 15, 15)
-_UNSPLASH_QUERIES = [
-    "family lifestyle", "family outdoor",
-    "parents children home", "family portrait", "family vacation",
-]
 
 
 # ── Font utilities ────────────────────────────────────────────────────────────
@@ -77,87 +59,48 @@ def _esc(text: str) -> str:
     return text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
 
 
-# ── Gradient image generation (Unsplash fallback) ───────────────────────────
+# ── S3 photo download ─────────────────────────────────────────────────────────
 
-def _hsv_to_rgb(h_arr: np.ndarray, s: float, v: float):
-    h  = h_arr % 1.0
-    i  = (h * 6).astype(np.int32) % 6
-    f  = (h * 6) - (h * 6).astype(np.int32)
-    p, q = v*(1-s), v*(1-f*s)
-    t_v  = v*(1-(1-f)*s)
-    vv   = np.full_like(h, v)
-    r = np.select([i==0,i==1,i==2,i==3,i==4,i==5],[vv,q, p, p, t_v,vv])
-    g = np.select([i==0,i==1,i==2,i==3,i==4,i==5],[t_v,vv,vv,q, p,  p ])
-    b = np.select([i==0,i==1,i==2,i==3,i==4,i==5],[p, p, t_v,vv,vv, q ])
-    return r, g, b
+def _download_photos_from_s3(dest_dir: str, s3, bucket: str, prefix: str) -> list[str]:
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+    paginator  = s3.get_paginator("list_objects_v2")
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if os.path.splitext(obj["Key"])[1].lower() in IMAGE_EXTS:
+                keys.append(obj["Key"])
 
-
-def _generate_gradient(idx: int) -> Image.Image:
-    x = np.linspace(0,1,WIDTH,dtype=np.float32)
-    y = np.linspace(0,1,HEIGHT,dtype=np.float32)
-    X,Y = np.meshgrid(x,y)
-    rad = math.radians((idx*53)%360)
-    pat = idx % 6
-    if   pat==0: t=np.clip((X*math.cos(rad)+Y*math.sin(rad)+1)/2,0,1)
-    elif pat==1: t=np.clip(np.sqrt((X-.5)**2+(Y-.5)**2)/.8,0,1)
-    elif pat==2: t=X
-    elif pat==3: t=np.clip(np.sin(X*math.pi*2+idx*.4)*.3+Y,0,1)
-    elif pat==4: t=np.clip(1-np.sqrt((X-.5)**2+(Y-.5)**2)*2,0,1)
-    else:        t=np.clip(X*.6+Y*.4,0,1)
-    phi  = (1+math.sqrt(5))/2
-    h    = ((idx/phi)%1*(1-t)+((idx/phi+.38)%1)*t).astype(np.float32)
-    r,g,b = _hsv_to_rgb(h,.78,.92)
-    vig  = np.clip(1-np.sqrt((X-.5)**2+(Y-.5)**2)*1.1,.3,1.0)
-    rgb  = np.stack([np.clip(c*vig*255,0,255).astype(np.uint8) for c in (r,g,b)],axis=2)
-    return Image.fromarray(rgb,"RGB")
-
-
-# ── Unsplash download ────────────────────────────────────────────────────────
-
-def _download_from_unsplash(dest_dir: str, access_key: str, count: int) -> list[str]:
-    photo_urls: list[str] = []
-    for query in _UNSPLASH_QUERIES:
-        if len(photo_urls) >= count:
-            break
-        for page in range(1, 5):
-            if len(photo_urls) >= count:
-                break
-            api_url = (
-                "https://api.unsplash.com/search/photos"
-                f"?query={urllib.parse.quote(query)}&per_page=30&page={page}"
-                f"&orientation=landscape&client_id={access_key}"
-            )
-            req = urllib.request.Request(
-                api_url, headers={"Accept-Version":"v1","User-Agent":"ffmpeg-slideshow/1.0"})
-            try:
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    results = json.loads(r.read()).get("results",[])
-            except Exception as e:
-                print(f"  Unsplash API error: {e}"); break
-            if not results: break
-            for p in results:
-                raw = p["urls"]["raw"]
-                photo_urls.append(
-                    f"{raw}&w={WIDTH}&h={HEIGHT}&fit=crop&crop=faces,focalpoint&auto=format&q=85")
-                if len(photo_urls) >= count: break
-
-    if not photo_urls:
-        raise RuntimeError("Unsplash returned 0 photos")
+    if not keys:
+        raise RuntimeError(f"No images found at s3://{bucket}/{prefix}")
+    keys.sort()
 
     paths: list[str] = []
-    for i in range(count):
-        url  = photo_urls[i % len(photo_urls)]
-        path = os.path.join(dest_dir, f"photo_{i:03d}.jpg")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent":"ffmpeg-slideshow/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                with open(path,"wb") as f: f.write(r.read())
-        except Exception as e:
-            print(f"  Photo {i} failed ({e}), using gradient")
-            _generate_gradient(i).save(path,"JPEG",quality=85)
-        paths.append(path)
-        if (i+1)%10==0: print(f"  {i+1}/{count} downloaded")
+    for i, key in enumerate(keys):
+        ext  = os.path.splitext(key)[1].lower()
+        dest = os.path.join(dest_dir, f"photo_{i:03d}{ext}")
+        s3.download_file(bucket, key, dest)
+        paths.append(dest)
+        if (i + 1) % 10 == 0:
+            print(f"  {i+1}/{len(keys)} downloaded")
+    print(f"  {len(keys)} photos downloaded from s3://{bucket}/{prefix}")
     return paths
+
+
+# ── Dynamic scene plan ────────────────────────────────────────────────────────
+
+def _make_scene_plan(n: int) -> list[str]:
+    """Generate a scene plan that consumes exactly n source images."""
+    plan: list[str] = []
+    remaining, pi = n, 0
+    while remaining > 0:
+        stype = _SCENE_PATTERN[pi % len(_SCENE_PATTERN)]
+        cost  = _COST[stype]
+        if cost > remaining:
+            stype, cost = "full", 1
+        plan.append(stype)
+        remaining -= cost
+        pi += 1
+    return plan
 
 
 # ── Scene compositing ─────────────────────────────────────────────────────────
@@ -195,25 +138,21 @@ def compose_scene(scene_type: str, srcs: list[Image.Image]) -> Image.Image:
     return canvas
 
 
-def create_scene_frames(tmp_dir: str) -> list[str]:
+def create_scene_frames(tmp_dir: str) -> tuple[list[str], list[str]]:
+    """Returns (scene_paths, scene_plan)."""
     src_dir   = os.path.join(tmp_dir,"sources"); os.makedirs(src_dir,exist_ok=True)
     scene_dir = os.path.join(tmp_dir,"scenes");  os.makedirs(scene_dir,exist_ok=True)
 
-    access_key = os.environ.get("UNSPLASH_ACCESS_KEY")
-    if access_key:
-        print(f"Downloading {NUM_SOURCE_IMAGES} photos from Unsplash…")
-        src_paths = _download_from_unsplash(src_dir, access_key, NUM_SOURCE_IMAGES)
-    else:
-        print(f"Generating {NUM_SOURCE_IMAGES} gradient images…")
-        src_paths = []
-        for i in range(NUM_SOURCE_IMAGES):
-            p = os.path.join(src_dir,f"src_{i:03d}.jpg")
-            _generate_gradient(i).save(p,"JPEG",quality=85)
-            src_paths.append(p)
+    s3     = boto3.client("s3")
+    bucket = os.environ.get("PHOTOS_S3_BUCKET", os.environ["OUTPUT_BUCKET"])
+    prefix = os.environ["PHOTOS_S3_PREFIX"]
+    print(f"Downloading photos from s3://{bucket}/{prefix}…")
+    src_paths  = _download_photos_from_s3(src_dir, s3, bucket, prefix)
+    scene_plan = _make_scene_plan(len(src_paths))
 
     scene_paths: list[str] = []
     src_idx = 0
-    for si, stype in enumerate(SCENE_PLAN):
+    for si, stype in enumerate(scene_plan):
         cost = _COST[stype]
         srcs = [Image.open(src_paths[src_idx+j]) for j in range(cost)]
         src_idx += cost
@@ -222,65 +161,25 @@ def create_scene_frames(tmp_dir: str) -> list[str]:
         frame.save(p,"JPEG",quality=90)
         scene_paths.append(p)
 
-    print(f"Composed {NUM_SCENES} scenes "
-          f"({SCENE_PLAN.count('full')} full / {SCENE_PLAN.count('lr')} lr / "
-          f"{SCENE_PLAN.count('tb')} tb / {SCENE_PLAN.count('grid')} grid)")
-    return scene_paths
+    print(f"Composed {len(scene_plan)} scenes from {len(src_paths)} photos "
+          f"({scene_plan.count('full')} full / {scene_plan.count('lr')} lr / "
+          f"{scene_plan.count('tb')} tb / {scene_plan.count('grid')} grid)")
+    return scene_paths, scene_plan
 
 
 # ── Music download ────────────────────────────────────────────────────────────
 
-def _download_from_jamendo(tmp_dir: str, client_id: str, min_dur: float) -> str:
-    import random
-
-    def _search(extra: str) -> list:
-        url = (
-            "https://api.jamendo.com/v3.0/tracks/"
-            f"?client_id={client_id}&format=json&limit=20"
-            "&tags=acoustic&vocalinstrumental=instrumental"
-            f"&audioformat=mp31&order=popularity_total{extra}"
-        )
-        req = urllib.request.Request(url,headers={"User-Agent":"ffmpeg-slideshow/1.0"})
-        with urllib.request.urlopen(req,timeout=15) as r:
-            return json.loads(r.read()).get("results",[])
-
-    results = _search(f"&durationbetween={int(min_dur)}_600") or _search("")
-    if not results:
-        raise RuntimeError("Jamendo returned 0 tracks — check JAMENDO_CLIENT_ID")
-
-    track = random.choice(results)
-    print(f"Music: '{track['name']}' / {track['artist_name']} ({track['duration']}s) [Jamendo CC]")
-    path = os.path.join(tmp_dir,"music.mp3")
-    req  = urllib.request.Request(track["audio"],headers={"User-Agent":"ffmpeg-slideshow/1.0"})
-    with urllib.request.urlopen(req,timeout=60) as r:
-        with open(path,"wb") as f: f.write(r.read())
-    return path
-
-
-def get_music(tmp_dir: str, total_duration: float) -> str | None:
-    path = os.path.join(tmp_dir,"music.mp3")
-
+def get_music(tmp_dir: str) -> str | None:
     s3_key = os.environ.get("MUSIC_S3_KEY")
-    if s3_key:
-        print(f"Downloading music from S3…")
-        boto3.client("s3").download_file(os.environ["OUTPUT_BUCKET"],s3_key,path)
-        return path
+    if not s3_key:
+        print("MUSIC_S3_KEY not set — no BGM")
+        return None
 
-    music_url = os.environ.get("MUSIC_URL")
-    if music_url:
-        print("Downloading music from URL…")
-        req = urllib.request.Request(music_url,headers={"User-Agent":"ffmpeg-slideshow/1.0"})
-        with urllib.request.urlopen(req,timeout=60) as r:
-            with open(path,"wb") as f: f.write(r.read())
-        return path
-
-    jamendo_id = os.environ.get("JAMENDO_CLIENT_ID")
-    if jamendo_id:
-        print("Searching Jamendo…")
-        return _download_from_jamendo(tmp_dir, jamendo_id, total_duration)
-
-    print("No music configured")
-    return None
+    path   = os.path.join(tmp_dir, "music.mp3")
+    bucket = os.environ.get("MUSIC_S3_BUCKET", os.environ["OUTPUT_BUCKET"])
+    print(f"Downloading music from s3://{bucket}/{s3_key}…")
+    boto3.client("s3").download_file(bucket, s3_key, path)
+    return path
 
 
 # ── Intro clip (cinematic title card) ─────────────────────────────────────────
@@ -353,67 +252,6 @@ def create_intro_clip(tmp_dir: str, title: str, subtitle: str, location: str) ->
         raise RuntimeError(f"Intro FFmpeg failed:\n{r.stderr[-2000:]}")
 
     print(f"Intro created: {out}")
-    return out
-
-
-# ── FIN card ─────────────────────────────────────────────────────────────────
-
-def create_fin_clip(tmp_dir: str) -> str:
-    """Render a cinematic 'FIN' title card — black bg, serif-style fade in/out."""
-    import shutil
-
-    font_bold = _find_font(bold=True)
-    fnt_fin   = ImageFont.truetype(font_bold, 120)
-    fnt_line  = ImageFont.truetype(_find_font(bold=False), 20)
-
-    D            = FIN_DURATION
-    total_frames = int(D * FPS)
-    frames_dir   = os.path.join(tmp_dir, "fin_frames")
-    os.makedirs(frames_dir, exist_ok=True)
-    black        = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
-
-    for fn in range(total_frames):
-        t = fn / FPS
-
-        # Fade in 0-1.5s, hold 1.5-3.5s, fade out 3.5-5s
-        if   t < 1.5:          a = t / 1.5
-        elif t < 3.5:          a = 1.0
-        elif t < D:            a = (D - t) / 1.5
-        else:                  a = 0.0
-
-        base = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 255))
-        over = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(over)
-        cy   = HEIGHT // 2
-
-        def put(text, font, y, color, alpha_val):
-            if alpha_val <= 0:
-                return
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw   = bbox[2] - bbox[0]
-            x    = (WIDTH - tw) // 2
-            draw.text((x, y), text, font=font, fill=(*color, int(alpha_val * 255)))
-
-        put("FIN",      fnt_fin,  cy - 65, (255, 255, 255), a)
-        put("─" * 20,   fnt_line, cy + 68, (100, 100, 100), a)
-
-        frame = Image.alpha_composite(base, over).convert("RGB")
-        frame.save(os.path.join(frames_dir, f"f{fn:05d}.png"), "PNG")
-
-    out = os.path.join(tmp_dir, "fin.mp4")
-    cmd = [
-        "ffmpeg", "-y",
-        "-framerate", str(FPS),
-        "-i", os.path.join(frames_dir, "f%05d.png"),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-pix_fmt", "yuv420p",
-        "-an", out,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    shutil.rmtree(frames_dir, ignore_errors=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"FIN FFmpeg failed:\n{r.stderr[-2000:]}")
-
-    print(f"FIN card created: {out}")
     return out
 
 
@@ -653,25 +491,22 @@ def lambda_handler(event, context):
 
         # 2. Photo scenes
         print("── Scene frames ──")
-        scene_paths = create_scene_frames(tmp_dir)
+        scene_paths, scene_plan = create_scene_frames(tmp_dir)
+        num_photos = sum(_COST[s] for s in scene_plan)
 
         # 3. Main slideshow (no music)
         print("── Slideshow clip ──")
         slideshow_path = os.path.join(tmp_dir, "slideshow.mp4")
         build_slideshow_clip(scene_paths, slideshow_path)
 
-        # 4. FIN card
-        print("── FIN card ──")
-        fin_path = create_fin_clip(tmp_dir)
-
-        # 5. Scrolling end credits
+        # 4. Scrolling end credits
         print("── Outro ──")
-        outro_path = create_outro_clip(tmp_dir, title, NUM_SOURCE_IMAGES, year)
+        outro_path = create_outro_clip(tmp_dir, title, num_photos, year)
 
-        # 6. Music
-        all_clips  = [intro_path, slideshow_path, fin_path, outro_path]
+        # 5. Music
+        all_clips  = [intro_path, slideshow_path, outro_path]
         total_dur  = sum(_get_duration(p) for p in all_clips)
-        music_path = get_music(tmp_dir, total_dur)
+        music_path = get_music(tmp_dir)
 
         # 7. Concat everything + mix music
         print("── Final concat ──")
