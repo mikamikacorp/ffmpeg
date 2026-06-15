@@ -19,6 +19,9 @@ INTRO_DURATION = 8.0   # cinematic title card
 FIN_DURATION   = 5.0   # "FIN" card between slideshow and credits
 OUTRO_DURATION = 22.0  # scrolling end credits
 
+NUM_VIDEO_INSERTS = 5    # number of video clips to randomly insert
+MAX_VIDEO_DURATION = 12.0  # cap each inserted video at this many seconds
+
 # ── Scene plan (50 scenes) ───────────────────────────────────────────────────
 SCENE_PLAN = [
     "full", "full", "lr",   "full", "full",
@@ -139,6 +142,37 @@ def _download_from_s3_images(dest_dir: str, bucket: str, prefix: str, count: int
         paths.append(path)
         if (i + 1) % 10 == 0:
             print(f"  {i+1}/{count} downloaded")
+
+    return paths
+
+
+# ── S3 video download ────────────────────────────────────────────────────────
+
+def _download_from_s3_videos(dest_dir: str, bucket: str, prefix: str, count: int) -> list[str]:
+    import random
+    s3        = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+                keys.append(key)
+
+    if not keys:
+        raise RuntimeError(f"No videos found in s3://{bucket}/{prefix}")
+
+    print(f"Found {len(keys)} videos in s3://{bucket}/{prefix}")
+    selected = random.sample(keys, min(count, len(keys)))
+
+    paths: list[str] = []
+    for i, key in enumerate(selected):
+        ext  = os.path.splitext(key)[1] or ".mp4"
+        path = os.path.join(dest_dir, f"video_{i:03d}{ext}")
+        s3.download_file(bucket, key, path)
+        print(f"  Video {i+1}/{len(selected)}: {key}")
+        paths.append(path)
 
     return paths
 
@@ -576,32 +610,67 @@ def create_outro_clip(tmp_dir: str, title: str, num_photos: int, year: str) -> s
     return out
 
 
+# ── Mixed sequence builder ────────────────────────────────────────────────────
+
+def _build_mixed_sequence(scene_paths: list[str], video_paths: list[str]) -> list[dict]:
+    """Randomly insert video clips at distinct positions within the scene list."""
+    import random
+    items = [{"type": "image", "path": p} for p in scene_paths]
+    n = len(items)
+    positions = sorted(random.sample(range(1, n), min(len(video_paths), n - 1)))
+    for offset, (pos, vpath) in enumerate(zip(positions, video_paths)):
+        items.insert(pos + offset, {"type": "video", "path": vpath})
+    return items
+
+
 # ── Main slideshow clip (no music, no intro/outro) ────────────────────────────
 
-def build_slideshow_clip(paths: list[str], out_path: str) -> str:
-    n     = len(paths)
-    step  = DURATION - TRANSITION
-    total = n * DURATION - (n-1) * TRANSITION
+def build_slideshow_clip(items: list[dict], out_path: str) -> str:
+    """items: list of {"type": "image"|"video", "path": str}"""
+    n = len(items)
+
+    durations: list[float] = []
+    for item in items:
+        if item["type"] == "image":
+            durations.append(DURATION)
+        else:
+            d = _get_duration(item["path"])
+            durations.append(min(d, MAX_VIDEO_DURATION))
 
     cmd = ["ffmpeg", "-y", "-threads", "0"]
-    for p in paths:
-        cmd += ["-loop","1","-framerate",str(FPS),"-t",str(DURATION+TRANSITION),"-i",p]
+    for i, item in enumerate(items):
+        if item["type"] == "image":
+            cmd += ["-loop", "1", "-framerate", str(FPS),
+                    "-t", str(durations[i] + TRANSITION), "-i", item["path"]]
+        else:
+            cmd += ["-i", item["path"]]
 
+    scale_pad = (
+        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS}"
+    )
     filters: list[str] = []
-    for i in range(n):
+    for i, item in enumerate(items):
+        if item["type"] == "image":
+            filters.append(f"[{i}:v]{scale_pad}[s{i}]")
+        else:
+            trim_dur = durations[i] + TRANSITION
+            filters.append(
+                f"[{i}:v]trim=0:{trim_dur:.3f},setpts=PTS-STARTPTS,{scale_pad}[s{i}]"
+            )
+
+    cur    = "s0"
+    offset = 0.0
+    for i in range(n - 1):
+        lbl = "final" if i == n - 2 else f"x{i}"
+        tr  = TRANSITIONS[i % len(TRANSITIONS)]
+        offset += durations[i] - TRANSITION
         filters.append(
-            f"[{i}:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
-            f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS}[s{i}]"
+            f"[{cur}][s{i+1}]xfade=transition={tr}:duration={TRANSITION}:offset={offset:.3f}[{lbl}]"
         )
-    cur = "s0"
-    for i in range(n-1):
-        out  = "final" if i==n-2 else f"x{i}"
-        tr   = TRANSITIONS[i % len(TRANSITIONS)]
-        off  = step*(i+1)
-        filters.append(
-            f"[{cur}][s{i+1}]xfade=transition={tr}:duration={TRANSITION}:offset={off:.3f}[{out}]"
-        )
-        cur = out
+        cur = lbl
+
+    total = sum(durations) - (n - 1) * TRANSITION
 
     cmd += [
         "-filter_complex", ";".join(filters),
@@ -693,16 +762,32 @@ def lambda_handler(event, context):
         print("── Scene frames ──")
         scene_paths = create_scene_frames(tmp_dir)
 
-        # 3. Main slideshow (no music)
+        # 3. Video inserts
+        print("── Video inserts ──")
+        video_dir = os.path.join(tmp_dir, "videos")
+        os.makedirs(video_dir, exist_ok=True)
+        videos_bucket = os.environ.get("VIDEOS_S3_BUCKET")
+        if videos_bucket:
+            videos_prefix = os.environ.get("VIDEOS_S3_PREFIX", "")
+            print(f"Downloading up to {NUM_VIDEO_INSERTS} videos from S3…")
+            video_paths = _download_from_s3_videos(
+                video_dir, videos_bucket, videos_prefix, NUM_VIDEO_INSERTS)
+            items = _build_mixed_sequence(scene_paths, video_paths)
+            print(f"Mixed sequence: {len(scene_paths)} images + {len(video_paths)} videos")
+        else:
+            print("VIDEOS_S3_BUCKET not set — images only")
+            items = [{"type": "image", "path": p} for p in scene_paths]
+
+        # 4. Main slideshow (no music)
         print("── Slideshow clip ──")
         slideshow_path = os.path.join(tmp_dir, "slideshow.mp4")
-        build_slideshow_clip(scene_paths, slideshow_path)
+        build_slideshow_clip(items, slideshow_path)
 
-        # 4. Scrolling end credits
+        # 5. Scrolling end credits
         print("── Outro ──")
         outro_path = create_outro_clip(tmp_dir, title, NUM_SOURCE_IMAGES, year)
 
-        # 5. Music
+        # 6. Music
         all_clips  = [intro_path, slideshow_path, outro_path]
         total_dur  = sum(_get_duration(p) for p in all_clips)
         music_path = get_music(tmp_dir, total_dur)
@@ -711,7 +796,7 @@ def lambda_handler(event, context):
         print("── Final concat ──")
         concat_with_music(all_clips, music_path, out_path)
 
-        # 7. Upload to S3
+        # 8. Upload to S3
         size = os.path.getsize(out_path)
         s3   = boto3.client("s3")
         s3.upload_file(out_path, bucket, key, ExtraArgs={"ContentType":"video/mp4"})
