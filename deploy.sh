@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 FUNCTION_NAME="ffmpeg-slideshow"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+REGION="${AWS_DEFAULT_REGION:-ap-northeast-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ECR_REPO_NAME="ffmpeg-slideshow"
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}"
@@ -55,7 +55,7 @@ aws ecr get-login-password --region "${REGION}" | \
 # ─── 3. Docker build & push ───────────────────────────────────────────────────
 echo ""
 echo "[3/5] Docker build & push…"
-docker build --platform linux/amd64 --provenance=false -t "${ECR_REPO_NAME}:latest" .
+docker build --platform linux/amd64 -t "${ECR_REPO_NAME}:latest" .
 docker tag "${ECR_REPO_NAME}:latest" "${ECR_URI}:latest"
 docker push "${ECR_URI}:latest"
 
@@ -150,7 +150,13 @@ fi
 
 ENV_VARS="Variables={${ENV_VARS}}"
 
-if aws lambda get-function --function-name "${FUNCTION_NAME}" --region "${REGION}" &>/dev/null; then
+EXISTING_PKG_TYPE=$(aws lambda get-function \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}" \
+    --query 'Configuration.PackageType' \
+    --output text 2>/dev/null || echo "NONE")
+
+if [ "${EXISTING_PKG_TYPE}" = "Image" ]; then
     echo "      Updating code…"
     aws lambda update-function-code \
         --function-name "${FUNCTION_NAME}" \
@@ -165,6 +171,24 @@ if aws lambda get-function --function-name "${FUNCTION_NAME}" --region "${REGION
 
     aws lambda update-function-configuration \
         --function-name "${FUNCTION_NAME}" \
+        --timeout 900 \
+        --memory-size 3008 \
+        --environment "${ENV_VARS}" \
+        --region "${REGION}" \
+        --output text --no-cli-pager
+elif [ "${EXISTING_PKG_TYPE}" = "Zip" ]; then
+    echo "      Existing function is Zip type — deleting to recreate as Image…"
+    aws lambda delete-function \
+        --function-name "${FUNCTION_NAME}" \
+        --region "${REGION}"
+    echo "      Waiting for deletion…"
+    sleep 5
+    echo "      Creating Image-based function…"
+    aws lambda create-function \
+        --function-name "${FUNCTION_NAME}" \
+        --package-type Image \
+        --code "ImageUri=${IMAGE_URI}" \
+        --role "${ROLE_ARN}" \
         --timeout 900 \
         --memory-size 3008 \
         --environment "${ENV_VARS}" \
