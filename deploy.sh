@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required (brew install jq)" >&2; exit 1; }
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 FUNCTION_NAME="ffmpeg-slideshow"
 REGION="${AWS_DEFAULT_REGION:-ap-northeast-1}"
@@ -122,36 +124,66 @@ echo ""
 echo "[5/5] Lambda function…"
 IMAGE_URI="${ECR_URI}:latest"
 
-# Build Lambda environment variables
+# Fetch existing environment variables (e.g. ones set manually via the console)
+# so the update below merges into them instead of wiping them out.
+EXISTING_ENV_JSON=$(aws lambda get-function-configuration \
+    --function-name "${FUNCTION_NAME}" \
+    --region "${REGION}" \
+    --query 'Environment.Variables' \
+    --output json 2>/dev/null || echo "null")
+if [ "${EXISTING_ENV_JSON}" = "null" ]; then
+    EXISTING_ENV_JSON="{}"
+fi
+
+# Build the subset of environment variables this script manages
 TITLE_TEXT="${TITLE_TEXT:-Family Memories}"
 SUBTITLE_TEXT="${SUBTITLE_TEXT:-Summer 2025}"
 LOCATION_TEXT="${LOCATION_TEXT:-Japan}"
-ENV_VARS="OUTPUT_BUCKET=${S3_BUCKET},TITLE_TEXT=${TITLE_TEXT},SUBTITLE_TEXT=${SUBTITLE_TEXT},LOCATION_TEXT=${LOCATION_TEXT}"
+NEW_ENV_JSON=$(jq -n \
+    --arg output_bucket "${S3_BUCKET}" \
+    --arg title "${TITLE_TEXT}" \
+    --arg subtitle "${SUBTITLE_TEXT}" \
+    --arg location "${LOCATION_TEXT}" \
+    '{OUTPUT_BUCKET: $output_bucket, TITLE_TEXT: $title, SUBTITLE_TEXT: $subtitle, LOCATION_TEXT: $location}')
 echo "      Title    : ${TITLE_TEXT}"
 echo "      Subtitle : ${SUBTITLE_TEXT}"
 echo "      Location : ${LOCATION_TEXT}"
 
 if [ -n "${UNSPLASH_ACCESS_KEY:-}" ]; then
-    ENV_VARS="${ENV_VARS},UNSPLASH_ACCESS_KEY=${UNSPLASH_ACCESS_KEY}"
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${UNSPLASH_ACCESS_KEY}" '. + {UNSPLASH_ACCESS_KEY: $v}')
     echo "      Unsplash API key : set"
 else
-    echo "      Unsplash API key : not set (gradient fallback)"
+    echo "      Unsplash API key : not set (env var not passed — keeping existing value, if any)"
 fi
 
 if [ -n "${MUSIC_S3_KEY:-}" ]; then
-    ENV_VARS="${ENV_VARS},MUSIC_S3_KEY=${MUSIC_S3_KEY}"
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${MUSIC_S3_KEY}" '. + {MUSIC_S3_KEY: $v}')
     echo "      Music (S3 key)   : ${MUSIC_S3_KEY}"
 elif [ -n "${MUSIC_URL:-}" ]; then
-    ENV_VARS="${ENV_VARS},MUSIC_URL=${MUSIC_URL}"
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${MUSIC_URL}" '. + {MUSIC_URL: $v}')
     echo "      Music (URL)      : set"
 elif [ -n "${JAMENDO_CLIENT_ID:-}" ]; then
-    ENV_VARS="${ENV_VARS},JAMENDO_CLIENT_ID=${JAMENDO_CLIENT_ID}"
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${JAMENDO_CLIENT_ID}" '. + {JAMENDO_CLIENT_ID: $v}')
     echo "      Music (Jamendo)  : client_id set"
 else
-    echo "      Music            : not set (no BGM)"
+    echo "      Music            : not passed — keeping existing value, if any"
 fi
 
-ENV_VARS="Variables={${ENV_VARS}}"
+if [ -n "${VIDEOS_S3_BUCKET:-}" ]; then
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${VIDEOS_S3_BUCKET}" '. + {VIDEOS_S3_BUCKET: $v}')
+    echo "      Videos bucket    : ${VIDEOS_S3_BUCKET}"
+else
+    echo "      Videos bucket    : not passed — keeping existing value, if any"
+fi
+
+if [ -n "${VIDEOS_S3_PREFIX:-}" ]; then
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${VIDEOS_S3_PREFIX}" '. + {VIDEOS_S3_PREFIX: $v}')
+    echo "      Videos prefix    : ${VIDEOS_S3_PREFIX}"
+fi
+
+# Merge: existing console-set values, overridden by anything this script sets
+MERGED_ENV_JSON=$(jq -n --argjson existing "${EXISTING_ENV_JSON}" --argjson new "${NEW_ENV_JSON}" '$existing + $new')
+ENV_VARS=$(jq -n --argjson vars "${MERGED_ENV_JSON}" '{Variables: $vars}')
 
 EXISTING_PKG_TYPE=$(aws lambda get-function \
     --function-name "${FUNCTION_NAME}" \
