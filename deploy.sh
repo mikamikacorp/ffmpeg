@@ -135,19 +135,32 @@ if [ "${EXISTING_ENV_JSON}" = "null" ]; then
     EXISTING_ENV_JSON="{}"
 fi
 
-# Build the subset of environment variables this script manages
-TITLE_TEXT="${TITLE_TEXT:-Family Memories}"
-SUBTITLE_TEXT="${SUBTITLE_TEXT:-Summer 2025}"
-LOCATION_TEXT="${LOCATION_TEXT:-Japan}"
-NEW_ENV_JSON=$(jq -n \
-    --arg output_bucket "${S3_BUCKET}" \
-    --arg title "${TITLE_TEXT}" \
-    --arg subtitle "${SUBTITLE_TEXT}" \
-    --arg location "${LOCATION_TEXT}" \
-    '{OUTPUT_BUCKET: $output_bucket, TITLE_TEXT: $title, SUBTITLE_TEXT: $subtitle, LOCATION_TEXT: $location}')
-echo "      Title    : ${TITLE_TEXT}"
-echo "      Subtitle : ${SUBTITLE_TEXT}"
-echo "      Location : ${LOCATION_TEXT}"
+# Build the subset of environment variables this script manages.
+# TITLE_TEXT/SUBTITLE_TEXT/LOCATION_TEXT etc. are only overridden when the
+# shell env var is explicitly passed in — otherwise the existing (e.g.
+# console-set) value is left untouched.
+NEW_ENV_JSON=$(jq -n --arg output_bucket "${S3_BUCKET}" '{OUTPUT_BUCKET: $output_bucket}')
+
+if [ -n "${TITLE_TEXT:-}" ]; then
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${TITLE_TEXT}" '. + {TITLE_TEXT: $v}')
+    echo "      Title    : ${TITLE_TEXT}"
+else
+    echo "      Title    : not passed — keeping existing value, if any"
+fi
+
+if [ -n "${SUBTITLE_TEXT:-}" ]; then
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${SUBTITLE_TEXT}" '. + {SUBTITLE_TEXT: $v}')
+    echo "      Subtitle : ${SUBTITLE_TEXT}"
+else
+    echo "      Subtitle : not passed — keeping existing value, if any"
+fi
+
+if [ -n "${LOCATION_TEXT:-}" ]; then
+    NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${LOCATION_TEXT}" '. + {LOCATION_TEXT: $v}')
+    echo "      Location : ${LOCATION_TEXT}"
+else
+    echo "      Location : not passed — keeping existing value, if any"
+fi
 
 if [ -n "${UNSPLASH_ACCESS_KEY:-}" ]; then
     NEW_ENV_JSON=$(echo "${NEW_ENV_JSON}" | jq --arg v "${UNSPLASH_ACCESS_KEY}" '. + {UNSPLASH_ACCESS_KEY: $v}')
@@ -183,6 +196,13 @@ fi
 
 # Merge: existing console-set values, overridden by anything this script sets
 MERGED_ENV_JSON=$(jq -n --argjson existing "${EXISTING_ENV_JSON}" --argjson new "${NEW_ENV_JSON}" '$existing + $new')
+
+# Apply defaults only where a value has never been set (e.g. first-ever deploy)
+MERGED_ENV_JSON=$(echo "${MERGED_ENV_JSON}" | jq '
+    .TITLE_TEXT    //= "Family Memories" |
+    .SUBTITLE_TEXT //= "Summer 2025" |
+    .LOCATION_TEXT //= "Japan"
+')
 ENV_VARS=$(jq -n --argjson vars "${MERGED_ENV_JSON}" '{Variables: $vars}')
 
 EXISTING_PKG_TYPE=$(aws lambda get-function \
