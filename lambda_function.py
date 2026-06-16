@@ -12,7 +12,6 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ── Video constants ──────────────────────────────────────────────────────────
 WIDTH, HEIGHT, FPS = 1280, 720, 30
-DURATION   = 4.1   # seconds each photo scene is displayed
 TRANSITION = 0.5   # xfade transition duration
 
 INTRO_DURATION = 8.0   # cinematic title card
@@ -21,6 +20,13 @@ OUTRO_DURATION = 22.0  # scrolling end credits
 
 NUM_VIDEO_INSERTS = 5    # number of video clips to randomly insert
 MAX_VIDEO_DURATION = 12.0  # cap each inserted video at this many seconds
+
+# The slideshow should run ~3 minutes total no matter how many photos/videos
+# end up in the mix, so per-photo display time is derived (in
+# build_slideshow_clip) from this budget rather than fixed.
+TOTAL_TARGET_DURATION     = 180.0
+SLIDESHOW_TARGET_DURATION = TOTAL_TARGET_DURATION - INTRO_DURATION - OUTRO_DURATION
+MIN_IMAGE_DURATION = 1.5   # floor so crossfades still look reasonable
 
 # ── Scene plan (50 scenes) ───────────────────────────────────────────────────
 SCENE_PLAN = [
@@ -121,6 +127,7 @@ def _generate_gradient(idx: int) -> Image.Image:
 # ── S3 image download ─────────────────────────────────────────────────────────
 
 def _download_from_s3_images(dest_dir: str, bucket: str, prefix: str, count: int) -> list[str]:
+    import random
     s3        = boto3.client("s3")
     paginator = s3.get_paginator("list_objects_v2")
 
@@ -135,6 +142,7 @@ def _download_from_s3_images(dest_dir: str, bucket: str, prefix: str, count: int
         raise RuntimeError(f"No images found in s3://{bucket}/{prefix}")
 
     print(f"Found {len(keys)} images in s3://{bucket}/{prefix}")
+    random.shuffle(keys)  # pick in random order each run (cycles if count > len(keys))
 
     paths: list[str] = []
     for i in range(count):
@@ -526,6 +534,8 @@ def _credits_lines(title: str, num_photos: int, year: str) -> list[tuple[str,str
         ("big",     year),
         ("empty",   ""),
         ("empty",   ""),
+        ("empty",   ""),
+        ("fin",     "Fin"),
     ]
 
 
@@ -534,13 +544,15 @@ def _render_credits_image(tmp_dir: str, lines: list[tuple[str,str]]) -> tuple[st
     font_bold = _find_font(bold=True)
     font_reg  = _find_font(bold=False)
 
-    _LH    = {"big":90, "section":65, "medium":55, "small":50, "empty":30, "divider":40}
-    _FS    = {"big":56, "section":40, "medium":36, "small":28, "divider":24}
+    _LH    = {"big":90, "section":65, "medium":55, "small":50, "empty":30, "divider":40, "fin":120}
+    _FS    = {"big":56, "section":40, "medium":36, "small":28, "divider":24, "fin":80}
     _COLOR = {"big":(240,240,240),"section":(200,200,200),"medium":(180,180,180),
-              "small":(150,150,150),"divider":(70,70,70)}
-    _BOLD  = {"big","section"}
+              "small":(150,150,150),"divider":(70,70,70),"fin":(240,240,240)}
+    _BOLD  = {"big","section","fin"}
 
-    total_h = HEIGHT + sum(_LH[t] for t,_ in lines) + HEIGHT
+    # Smaller trailing buffer than the leading one so the very last line
+    # ("Fin") is still on-screen when the scroll reaches its end and holds.
+    total_h = HEIGHT + sum(_LH[t] for t,_ in lines) + HEIGHT // 2
     img  = Image.new("RGB",(WIDTH,total_h),(0,0,0))
     draw = ImageDraw.Draw(img)
 
@@ -628,17 +640,37 @@ def _build_mixed_sequence(scene_paths: list[str], video_paths: list[str]) -> lis
 
 # ── Main slideshow clip (no music, no intro/outro) ────────────────────────────
 
-def build_slideshow_clip(items: list[dict], out_path: str) -> str:
+def build_slideshow_clip(
+    items: list[dict], out_path: str,
+    target_duration: float = SLIDESHOW_TARGET_DURATION,
+) -> str:
     """items: list of {"type": "image"|"video", "path": str}"""
     n = len(items)
 
+    # Videos are trimmed, not sped up, so their duration is fixed; the
+    # per-photo display time is solved so the whole clip lands on
+    # target_duration regardless of how many photos/videos are mixed in.
+    video_durations = [min(_get_duration(it["path"]), MAX_VIDEO_DURATION)
+                        for it in items if it["type"] == "video"]
+    num_images = n - len(video_durations)
+    if num_images:
+        image_duration = (target_duration - sum(video_durations)
+                           + (n - 1) * TRANSITION) / num_images
+        image_duration = max(image_duration, MIN_IMAGE_DURATION)
+    else:
+        image_duration = MIN_IMAGE_DURATION
+    print(f"Per-photo display time: {image_duration:.2f}s "
+          f"({num_images} photos, {len(video_durations)} videos, "
+          f"target {target_duration:.0f}s)")
+
     durations: list[float] = []
+    vi = 0
     for item in items:
         if item["type"] == "image":
-            durations.append(DURATION)
+            durations.append(image_duration)
         else:
-            d = _get_duration(item["path"])
-            durations.append(min(d, MAX_VIDEO_DURATION))
+            durations.append(video_durations[vi])
+            vi += 1
 
     cmd = ["ffmpeg", "-y", "-threads", "0"]
     for i, item in enumerate(items):
