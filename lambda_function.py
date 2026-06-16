@@ -63,7 +63,10 @@ _UNSPLASH_QUERIES = [
 
 def _find_font(bold: bool = False) -> str:
     import glob
-    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    # Noto Sans CJK JP covers Latin + Japanese glyphs, so テロップ text renders
+    # correctly regardless of whether TITLE_TEXT/SUBTITLE_TEXT/LOCATION_TEXT
+    # are set in English or Japanese.
+    name = "NotoSansCJKjp-Bold.otf" if bold else "NotoSansCJKjp-Regular.otf"
     # Fixed path set by Dockerfile (most reliable)
     fixed = f"/opt/fonts/{name}"
     if os.path.exists(fixed):
@@ -72,7 +75,7 @@ def _find_font(bold: bool = False) -> str:
     matches = glob.glob(f"/usr/share/fonts/**/{name}", recursive=True)
     if matches:
         return matches[0]
-    raise RuntimeError(f"{name} not found — install dejavu-sans-fonts")
+    raise RuntimeError(f"{name} not found — Dockerfile should download it into /opt/fonts")
 
 
 def _esc(text: str) -> str:
