@@ -222,6 +222,9 @@ echo "      Timeout  : ${TIMEOUT}s"
 echo "      Memory   : ${MEMORY_SIZE}MB"
 echo "      Ephemeral storage : ${EPHEMERAL_SIZE}MB"
 
+# Shown in the Lambda console's function list, so it's identifiable at a glance.
+DESCRIPTION="家族写真スライドショー生成（S3の写真/動画から約3分のMP4を作成しS3にアップロード）"
+
 if [ "${EXISTING_PKG_TYPE}" = "Image" ]; then
     echo "      Updating code…"
     aws lambda update-function-code \
@@ -237,6 +240,7 @@ if [ "${EXISTING_PKG_TYPE}" = "Image" ]; then
 
     aws lambda update-function-configuration \
         --function-name "${FUNCTION_NAME}" \
+        --description "${DESCRIPTION}" \
         --timeout "${TIMEOUT}" \
         --memory-size "${MEMORY_SIZE}" \
         --ephemeral-storage "Size=${EPHEMERAL_SIZE}" \
@@ -256,6 +260,7 @@ elif [ "${EXISTING_PKG_TYPE}" = "Zip" ]; then
         --package-type Image \
         --code "ImageUri=${IMAGE_URI}" \
         --role "${ROLE_ARN}" \
+        --description "${DESCRIPTION}" \
         --timeout "${TIMEOUT}" \
         --memory-size "${MEMORY_SIZE}" \
         --ephemeral-storage "Size=${EPHEMERAL_SIZE}" \
@@ -269,6 +274,7 @@ else
         --package-type Image \
         --code "ImageUri=${IMAGE_URI}" \
         --role "${ROLE_ARN}" \
+        --description "${DESCRIPTION}" \
         --timeout "${TIMEOUT}" \
         --memory-size "${MEMORY_SIZE}" \
         --ephemeral-storage "Size=${EPHEMERAL_SIZE}" \
