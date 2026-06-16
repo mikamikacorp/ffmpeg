@@ -26,7 +26,8 @@ MAX_VIDEO_DURATION = 12.0  # cap each inserted video at this many seconds
 # build_slideshow_clip) from this budget rather than fixed.
 TOTAL_TARGET_DURATION     = 180.0
 SLIDESHOW_TARGET_DURATION = TOTAL_TARGET_DURATION - INTRO_DURATION - OUTRO_DURATION
-MIN_IMAGE_DURATION = 1.5   # floor so crossfades still look reasonable
+MIN_IMAGE_DURATION = 3.0   # each photo must be shown at least this long
+MIN_VIDEO_DURATION = 1.0   # floor when videos get shrunk to make room for photos
 
 # ── Scene plan (50 scenes) ───────────────────────────────────────────────────
 SCENE_PLAN = [
@@ -647,20 +648,32 @@ def build_slideshow_clip(
     """items: list of {"type": "image"|"video", "path": str}"""
     n = len(items)
 
-    # Videos are trimmed, not sped up, so their duration is fixed; the
-    # per-photo display time is solved so the whole clip lands on
-    # target_duration regardless of how many photos/videos are mixed in.
+    # Photos always get at least MIN_IMAGE_DURATION; videos are trimmed
+    # (never sped up) and are the ones that shrink to make room when the
+    # natural split would otherwise push photos below that floor.
     video_durations = [min(_get_duration(it["path"]), MAX_VIDEO_DURATION)
                         for it in items if it["type"] == "video"]
     num_images = n - len(video_durations)
+    num_videos = len(video_durations)
+
     if num_images:
         image_duration = (target_duration - sum(video_durations)
                            + (n - 1) * TRANSITION) / num_images
-        image_duration = max(image_duration, MIN_IMAGE_DURATION)
     else:
         image_duration = MIN_IMAGE_DURATION
+
+    if image_duration < MIN_IMAGE_DURATION and num_videos:
+        image_duration = MIN_IMAGE_DURATION
+        video_budget = (target_duration - num_images * image_duration
+                         + (n - 1) * TRANSITION)
+        video_budget = max(video_budget, num_videos * MIN_VIDEO_DURATION)
+        scale = video_budget / sum(video_durations)
+        video_durations = [max(d * scale, MIN_VIDEO_DURATION) for d in video_durations]
+    else:
+        image_duration = max(image_duration, MIN_IMAGE_DURATION)
+
     print(f"Per-photo display time: {image_duration:.2f}s "
-          f"({num_images} photos, {len(video_durations)} videos, "
+          f"({num_images} photos, {num_videos} videos, "
           f"target {target_duration:.0f}s)")
 
     durations: list[float] = []
