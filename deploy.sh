@@ -124,16 +124,22 @@ echo ""
 echo "[5/5] Lambda function…"
 IMAGE_URI="${ECR_URI}:latest"
 
-# Fetch existing environment variables (e.g. ones set manually via the console)
-# so the update below merges into them instead of wiping them out.
-EXISTING_ENV_JSON=$(aws lambda get-function-configuration \
+# Fetch existing function config (env vars, memory, timeout, ephemeral storage,
+# package type — e.g. anything set manually via the console) so the update
+# below merges into it instead of wiping it out.
+EXISTING_CONFIG=$(aws lambda get-function \
     --function-name "${FUNCTION_NAME}" \
     --region "${REGION}" \
-    --query 'Environment.Variables' \
+    --query 'Configuration' \
     --output json 2>/dev/null || echo "null")
-if [ "${EXISTING_ENV_JSON}" = "null" ]; then
-    EXISTING_ENV_JSON="{}"
+if [ "${EXISTING_CONFIG}" = "null" ]; then
+    EXISTING_CONFIG="{}"
 fi
+EXISTING_ENV_JSON=$(echo "${EXISTING_CONFIG}" | jq '.Environment.Variables // {}')
+EXISTING_PKG_TYPE=$(echo "${EXISTING_CONFIG}" | jq -r '.PackageType // "NONE"')
+EXISTING_TIMEOUT=$(echo "${EXISTING_CONFIG}" | jq -r '.Timeout // empty')
+EXISTING_MEMORY=$(echo "${EXISTING_CONFIG}" | jq -r '.MemorySize // empty')
+EXISTING_EPHEMERAL=$(echo "${EXISTING_CONFIG}" | jq -r '.EphemeralStorage.Size // empty')
 
 # Build the subset of environment variables this script manages.
 # TITLE_TEXT/SUBTITLE_TEXT/LOCATION_TEXT etc. are only overridden when the
@@ -205,11 +211,16 @@ MERGED_ENV_JSON=$(echo "${MERGED_ENV_JSON}" | jq '
 ')
 ENV_VARS=$(jq -n --argjson vars "${MERGED_ENV_JSON}" '{Variables: $vars}')
 
-EXISTING_PKG_TYPE=$(aws lambda get-function \
-    --function-name "${FUNCTION_NAME}" \
-    --region "${REGION}" \
-    --query 'Configuration.PackageType' \
-    --output text 2>/dev/null || echo "NONE")
+# Memory / timeout / ephemeral storage: only override what's explicitly passed
+# in via shell env vars (LAMBDA_TIMEOUT / LAMBDA_MEMORY_SIZE /
+# LAMBDA_EPHEMERAL_STORAGE_SIZE) — otherwise keep the existing (e.g.
+# console-set) value, falling back to a sane default on first-ever deploy.
+TIMEOUT="${LAMBDA_TIMEOUT:-${EXISTING_TIMEOUT:-900}}"
+MEMORY_SIZE="${LAMBDA_MEMORY_SIZE:-${EXISTING_MEMORY:-3008}}"
+EPHEMERAL_SIZE="${LAMBDA_EPHEMERAL_STORAGE_SIZE:-${EXISTING_EPHEMERAL:-512}}"
+echo "      Timeout  : ${TIMEOUT}s"
+echo "      Memory   : ${MEMORY_SIZE}MB"
+echo "      Ephemeral storage : ${EPHEMERAL_SIZE}MB"
 
 if [ "${EXISTING_PKG_TYPE}" = "Image" ]; then
     echo "      Updating code…"
@@ -226,8 +237,9 @@ if [ "${EXISTING_PKG_TYPE}" = "Image" ]; then
 
     aws lambda update-function-configuration \
         --function-name "${FUNCTION_NAME}" \
-        --timeout 900 \
-        --memory-size 3008 \
+        --timeout "${TIMEOUT}" \
+        --memory-size "${MEMORY_SIZE}" \
+        --ephemeral-storage "Size=${EPHEMERAL_SIZE}" \
         --environment "${ENV_VARS}" \
         --region "${REGION}" \
         --output text --no-cli-pager
@@ -244,8 +256,9 @@ elif [ "${EXISTING_PKG_TYPE}" = "Zip" ]; then
         --package-type Image \
         --code "ImageUri=${IMAGE_URI}" \
         --role "${ROLE_ARN}" \
-        --timeout 900 \
-        --memory-size 3008 \
+        --timeout "${TIMEOUT}" \
+        --memory-size "${MEMORY_SIZE}" \
+        --ephemeral-storage "Size=${EPHEMERAL_SIZE}" \
         --environment "${ENV_VARS}" \
         --region "${REGION}" \
         --output text --no-cli-pager
@@ -256,8 +269,9 @@ else
         --package-type Image \
         --code "ImageUri=${IMAGE_URI}" \
         --role "${ROLE_ARN}" \
-        --timeout 900 \
-        --memory-size 3008 \
+        --timeout "${TIMEOUT}" \
+        --memory-size "${MEMORY_SIZE}" \
+        --ephemeral-storage "Size=${EPHEMERAL_SIZE}" \
         --environment "${ENV_VARS}" \
         --region "${REGION}" \
         --output text --no-cli-pager
